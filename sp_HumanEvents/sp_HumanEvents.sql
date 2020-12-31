@@ -455,7 +455,8 @@ DECLARE @session_filter_statement_completed NVARCHAR(MAX) = NCHAR(10) + N'      
 DECLARE @session_filter_blocking NVARCHAR(MAX) = NCHAR(10) + N'         sqlserver.is_system = 1 ' + NCHAR(10);
 /*for parameterization because blah blah*/
 DECLARE @session_filter_parameterization NVARCHAR(MAX) = NCHAR(10) + N'            sqlserver.is_system = 0 ' + NCHAR(10);
-
+/*for errors because blah blah, I think we may want is_system */
+DECLARE @session_filter_errors  NVARCHAR(MAX) = NCHAR(10) + N'            sqlserver.is_system = 0 ' + NCHAR(10);
 
 /*
 Create one filter per possible input.
@@ -551,7 +552,8 @@ IF LOWER(@event_type) NOT IN
           N'compilation',
           N'recompilation',
           N'compilations',
-          N'recompilations' )
+          N'recompilations',
+		  N'errors')
 BEGIN
     RAISERROR(N'You have chosen a value for @event_type... poorly. use @help = 1 to see valid arguments.', 16, 1) WITH NOWAIT;
     RAISERROR(N'What on earth is %s?', 16, 1, @event_type) WITH NOWAIT;
@@ -1262,6 +1264,12 @@ SET @session_filter_parameterization += ( ISNULL(@client_app_name_filter, N'') +
                                           ISNULL(@session_id_filter, N'') +
                                           ISNULL(@username_filter, N'') );
 
+/*errors - add filters that apply*/
+SET @session_filter_errors			 += ( ISNULL(@client_app_name_filter, N'') +
+                                          ISNULL(@client_hostname_filter, N'') +
+                                          ISNULL(@database_name_filter, N'') +
+                                          ISNULL(@session_id_filter, N'') +
+                                          ISNULL(@username_filter, N'') );
 
 --This section sets up the event session definition
 RAISERROR(N'Setting up the event session', 0, 1) WITH NOWAIT;
@@ -1342,6 +1350,12 @@ SET @session_sql +=
      WHERE ( ' + @session_filter_parameterization + N' ))'
                    ELSE N''
               END 
+    WHEN LOWER(@event_type) LIKE N'%errors%'
+         THEN N' 
+  ADD EVENT sqlserver.error_reported
+	(
+     ACTION (sqlserver.client_app_name,sqlserver.client_hostname,sqlserver.context_info,sqlserver.database_name,sqlserver.plan_handle,sqlserver.session_id,sqlserver.sql_text,sqlserver.tsql_stack,sqlserver.username)
+    WHERE ( ' + @session_filter_errors + N' ))'
         ELSE N'i have no idea what i''m doing.'
     END;
 --End event session definition  
@@ -2127,6 +2141,44 @@ BEGIN
             OPTION(RECOMPILE);
 
 END;
+
+IF LOWER(@event_type) LIKE N'%errors%'
+BEGIN
+            SELECT DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), SYSDATETIME()), c.value('@timestamp', 'DATETIME2')) AS event_time,
+                   c.value('@name', 'NVARCHAR(256)') AS event_type,
+                   c.value('(action[@name="database_name"]/value)[1]', 'NVARCHAR(256)') AS database_name,                
+                   c.value('(data[@name="message"]/value)[1]', 'NVARCHAR(256)') AS message,
+                   c.value('(action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)') AS sql_text,
+				   c.value('(action[@name="client_hostname"]/value)[1]', 'NVARCHAR(256)') AS client_hostname,
+				   c.value('(action[@name="client_app_name"]/value)[1]', 'NVARCHAR(256)') AS client_app_name,
+				   c.value('(action[@name="username"]/value)[1]', 'NVARCHAR(256)') AS username,
+				   c.value('(action[@name="session_id"]/value)[1]', 'INT') AS session_id,
+				   c.value('(data[@name="error_number"]/value)[1]', 'INT') AS error_number,
+				   c.value('(data[@name="severity"]/value)[1]', 'INT') AS severity,
+				   c.value('(data[@name="state"]/value)[1]', 'INT') AS state
+            INTO #errors
+			FROM #human_events_xml AS xet
+			OUTER APPLY xet.human_events_xml.nodes('//event') AS oa(c)
+
+            IF @debug = 1 BEGIN SELECT N'#errors' AS table_name, * FROM #errors AS r OPTION(RECOMPILE); END;
+
+            SELECT e.event_time,
+                   e.event_type,
+                   e.database_name,
+                   e.message,
+                   e.sql_text,
+				   e.client_hostname,
+				   e.client_app_name,
+				   e.username,
+				   e.session_id,
+				   e.error_number,
+				   e.severity,
+				   e.state
+            FROM #errors AS e
+            ORDER BY e.event_time
+            OPTION(RECOMPILE);
+END
+
 
 /*
 End magic happening
